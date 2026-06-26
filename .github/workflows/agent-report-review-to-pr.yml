@@ -1,0 +1,148 @@
+name: Agent Report Review → PR to Develop
+
+# ─────────────────────────────────────────────────────────────────────
+# Trigger: when a GitHub Issue is closed in the ai-reports repo.
+#
+# Flow:
+#   1. A closed issue whose title starts with "[Review Required]" signals
+#      that the doc-reviewer has approved the migration report on the
+#      agent branch.
+#   2. This workflow opens a Pull Request from agent → develop and
+#      assigns the configured PR reviewer.
+#
+# Required Repository Secrets (Settings → Secrets → Actions):
+#   PR_REVIEWER_GITHUB_USER  – GitHub username to request a PR review from
+#   WORKFLOW_PAT             – Fine-grained PAT with:
+#                               contents: write
+#                               pull-requests: write
+#                               issues: read
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  create-pr-to-develop:
+    # Only act on issues that were raised by the SB-Upgrade-Agent
+    if: startsWith(github.event.issue.title, '[Review Required]')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT }}
+          fetch-depth: 0   # need full history for branch comparison
+
+      # ── 2. Parse report details from issue title ──────────────────
+      - name: Parse report metadata
+        id: meta
+        run: |
+          ISSUE_TITLE="${{ github.event.issue.title }}"
+          # Title format: [Review Required] <projectName>_migration-report_<timestamp>.md
+          REPORT_FILENAME=$(echo "$ISSUE_TITLE" | sed 's/\[Review Required\] //')
+          # Extract project name (everything before _migration-report_)
+          PROJECT_NAME=$(echo "$REPORT_FILENAME" | sed 's/_migration-report_.*//')
+          echo "report_filename=$REPORT_FILENAME" >> "$GITHUB_OUTPUT"
+          echo "project_name=$PROJECT_NAME"       >> "$GITHUB_OUTPUT"
+          echo "pr_title=[Migration Report] ${PROJECT_NAME} — ready for develop" >> "$GITHUB_OUTPUT"
+
+      # ── 3. Verify agent branch has changes not on develop ─────────
+      - name: Check agent branch is ahead of develop
+        id: branch_check
+        run: |
+          git fetch origin agent develop
+          AHEAD=$(git rev-list --count origin/develop..origin/agent)
+          echo "commits_ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          if [[ "$AHEAD" -eq 0 ]]; then
+            echo "⚠️  agent branch has no new commits vs develop — skipping PR creation"
+          fi
+
+      # ── 4. Create Pull Request agent → develop ────────────────────
+      - name: Create Pull Request
+        if: steps.branch_check.outputs.commits_ahead != '0'
+        id: create_pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.WORKFLOW_PAT }}
+          script: |
+            const projectName    = '${{ steps.meta.outputs.project_name }}';
+            const reportFilename = '${{ steps.meta.outputs.report_filename }}';
+            const prTitle        = '${{ steps.meta.outputs.pr_title }}';
+            const issueNumber    = ${{ github.event.issue.number }};
+            const issueUrl       = '${{ github.event.issue.html_url }}';
+            const prReviewer     = '${{ secrets.PR_REVIEWER_GITHUB_USER }}';
+            const reportPath     = `reports/${projectName}/${reportFilename}`;
+
+            const prBody = [
+              `## Migration Report — PR to Develop`,
+              ``,
+              `**Project:** \`${projectName}\``,
+              `**Report:** [\`${reportFilename}\`](https://github.com/${{ github.repository }}/blob/agent/${reportPath})`,
+              ``,
+              `### Context`,
+              `This PR was raised automatically after doc-reviewer closed issue #${issueNumber} (${issueUrl}).`,
+              ``,
+              `### Review Checklist`,
+              `- [ ] Report content reviewed and approved (done — see issue #${issueNumber})`,
+              `- [ ] Branch diff looks clean (only the migration report file)`,
+              `- [ ] Merge strategy: squash merge preferred`,
+              ``,
+              `> _Raised automatically by SB-Upgrade-Agent GitHub Action_`,
+            ].join('\n');
+
+            // Create the PR
+            const { data: pr } = await github.rest.pulls.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  prTitle,
+              body:   prBody,
+              head:   'agent',
+              base:   'develop',
+            });
+
+            core.info(`✅ PR #${pr.number} created: ${pr.html_url}`);
+
+            // Assign PR reviewer
+            if (prReviewer) {
+              await github.rest.pulls.requestReviewers({
+                owner:     context.repo.owner,
+                repo:      context.repo.repo,
+                pull_number: pr.number,
+                reviewers: [prReviewer],
+              });
+              core.info(`   Review requested from @${prReviewer}`);
+            }
+
+            // Comment on the original issue with the PR link
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: issueNumber,
+              body: `✅ Doc review accepted. PR raised: ${pr.html_url}\nAssigned to @${prReviewer} for final approval before merge to \`develop\`.`,
+            });
+
+            core.setOutput('pr_url', pr.html_url);
+            core.setOutput('pr_number', String(pr.number));
+
+      # ── 5. Summary ────────────────────────────────────────────────
+      - name: Workflow summary
+        if: always()
+        run: |
+          echo "### SB-Upgrade-Agent — PR Creation Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Project | \`${{ steps.meta.outputs.project_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Report  | \`${{ steps.meta.outputs.report_filename }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Closed Issue | #${{ github.event.issue.number }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PR | ${{ steps.create_pr.outputs.pr_url || 'skipped — no new commits' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PR Reviewer | @${{ secrets.PR_REVIEWER_GITHUB_USER }} |" >> "$GITHUB_STEP_SUMMARY"
